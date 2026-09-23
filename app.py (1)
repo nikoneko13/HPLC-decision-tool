@@ -1,0 +1,164 @@
+import io
+import re
+import pandas as pd
+import streamlit as st
+
+
+def parse_hplc_file(file):
+    """Parses raw HPLC report CSV/TXT files by scanning line-by-line to locate
+
+    metadata and the peak results table dynamically, bypassing header line
+    mismatches.
+    """
+    try:
+        # 1. Read file buffer into text (handles both UTF-8 and legacy CP1252/Latin-1 encodings)
+        content = file.getvalue() if hasattr(file, "getvalue") else file.read()
+        if isinstance(content, bytes):
+            try:
+                text = content.decode("utf-8")
+            except UnicodeDecodeError:
+                text = content.decode("cp1252", errors="ignore")
+        else:
+            text = content
+
+        lines = text.splitlines()
+
+        header_line_idx = None
+        extracted_pressure = None
+
+        # Common keywords present in HPLC peak table headers (Agilent, Waters, Shimadzu, Thermo)
+        table_keywords = [
+            "ret.time",
+            "retention",
+            "rt",
+            "peak",
+            "res",
+            "resolution",
+            "area",
+        ]
+
+        # 2. Line-by-line scan for Metadata & Table Header
+        for idx, line in enumerate(lines):
+            line_str = line.strip()
+            if not line_str:
+                continue
+
+            # Extract pressure if recorded in header metadata (e.g., "Max Pressure: 280 bar")
+            if any(
+                p_term in line_str.lower()
+                for p_term in ["pressure", "pmax", "bar"]
+            ):
+                p_match = re.search(r"(\d+(?:\.\d+)?)", line_str)
+                if p_match and extracted_pressure is None:
+                    val = float(p_match.group(1))
+                    if val > 10.0:  # Ignore small numbers or single-digit IDs
+                        extracted_pressure = val
+
+            # Tokenize line to check if it matches a peak table header
+            tokens = [
+                t.strip().lower()
+                for t in re.split(r'[,;\t"]+', line_str)
+                if t.strip()
+            ]
+            matches = sum(
+                1 for kw in table_keywords if any(kw in t for t in tokens)
+            )
+
+            # If 2 or more chromatography keywords match, flag this row as the start of the table
+            if matches >= 2:
+                header_line_idx = idx
+                break
+
+        if header_line_idx is None:
+            st.error(
+                "Could not locate the peak table header in this file. Please verify file structure."
+            )
+            return None, None
+
+        # 3. Slice the file content starting from the detected table header line
+        table_content = "\n".join(lines[header_line_idx:])
+
+        # Parse table slice using python engine with separator auto-detection
+        df = pd.read_csv(
+            io.StringIO(table_content),
+            sep=None,
+            engine="python",
+            on_bad_lines="skip",
+        )
+
+        # Clean column names
+        df.columns = [
+            str(col).strip().replace('"', "") for col in df.columns
+        ]
+
+        # 4. Identify critical columns dynamically
+        rt_col = next(
+            (
+                c
+                for c in df.columns
+                if "retention" in c.lower() or c.lower() in ["rt", "ret.time"]
+            ),
+            None,
+        )
+        rs_col = next(
+            (
+                c
+                for c in df.columns
+                if "res" in c.lower() or "resolution" in c.lower()
+            ),
+            None,
+        )
+        p_col = next(
+            (
+                c
+                for c in df.columns
+                if "press" in c.lower() or "bar" in c.lower()
+            ),
+            None,
+        )
+
+        # Drop non-numeric rows (e.g., trailing totals/averages inserted by software)
+        if rt_col:
+            df[rt_col] = pd.to_numeric(df[rt_col], errors="coerce")
+            df = df.dropna(subset=[rt_col])
+
+        if df.empty or not rt_col:
+            st.error("No valid numeric peak rows found under table header.")
+            return None, None
+
+        # 5. Calculate Metrics
+        peak_count = len(df)
+        last_rt = df[rt_col].max()
+
+        if rs_col:
+            df[rs_col] = pd.to_numeric(df[rs_col], errors="coerce")
+            valid_rs = df[rs_col].dropna()
+            valid_rs = valid_rs[valid_rs > 0]
+            worst_rs = valid_rs.min() if not valid_rs.empty else 0.0
+        else:
+            worst_rs = 0.0
+
+        # Assign back pressure priority: Peak Table Column > Metadata Scan > UI Fallback
+        if p_col and not df[p_col].dropna().empty:
+            df[p_col] = pd.to_numeric(df[p_col], errors="coerce")
+            back_pressure = df[p_col].max()
+        elif extracted_pressure is not None:
+            back_pressure = extracted_pressure
+        else:
+            back_pressure = st.number_input(
+                "Back pressure not found in report metadata. Enter Pressure (bar):",
+                value=250.0,
+            )
+
+        metrics = {
+            "pressure": float(back_pressure),
+            "peak_count": int(peak_count),
+            "last_rt": float(last_rt),
+            "worst_rs": float(worst_rs),
+        }
+
+        return df, metrics
+
+    except Exception as e:
+        st.error(f"Error parsing file: {e}")
+        return None, None
